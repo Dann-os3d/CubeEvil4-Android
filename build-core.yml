@@ -1,0 +1,81 @@
+# Builds the CubeEvil4 "core" APK (with the entity randomizer) in the cloud.
+# Run it from the repository's "Actions" tab: "Build core APK" -> "Run workflow".
+name: Build core APK
+
+on:
+  # runs by itself whenever something is pushed to a branch that contains this file, and by hand
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "ABI of the game core: arm64-v8a (faster) or all (32 and 64 bit)"
+        default: "arm64-v8a"
+        type: choice
+        options: [arm64-v8a, all]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Unpack the randomizer package (when it was uploaded as a ZIP)
+        run: |
+          if [ -f CubeEvil4_Randomizer_Fix.zip ]; then unzip -oq CubeEvil4_Randomizer_Fix.zip; fi
+
+      - name: Apply the randomizer (idempotent)
+        run: |
+          if [ ! -f CubeEvil4_Randomizer_Fix/apply_randomizer_fix.py ]; then
+            echo "CubeEvil4_Randomizer_Fix (folder or .zip) is not in the repository root" >&2
+            exit 1
+          fi
+          python3 CubeEvil4_Randomizer_Fix/apply_randomizer_fix.py "$GITHUB_WORKSPACE"
+          python3 tools/check_entity_pool.py . || true
+          sh port/whole/runtime/tests/run_entity_random_test.sh
+
+      - name: Tools and Android NDK r28c for the game core
+        run: sudo bash port/tools/whole_setup_linux.sh --android
+
+      - name: Build the game core (native libraries)
+        run: bash port/tools/whole_build_android.sh --abi "${{ inputs.abi || 'arm64-v8a' }}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" \
+            "cmake;3.22.1" "ndk;28.2.13676358"
+
+      - name: Build the app (core flavour)
+        working-directory: port/android-decomp
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleCoreDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CubeEvil4-core-randomizer-apk
+          path: port/android-decomp/app/build/outputs/apk/core/debug/*.apk
+          if-no-files-found: error
+
+      - name: Keep the logs if it failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            port/build/**/*.log
+            port/build/**/CMakeError.log
+            port/android-decomp/app/build/reports/**
+          if-no-files-found: ignore
